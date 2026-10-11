@@ -1,0 +1,8 @@
+# Jaga format Linux/Mac untuk script shell
+*.sh text eol=lf
+
+# Jaga format Windows untuk script batch
+*.bat text eol=crlf
+
+# Jaga format LF untuk file Python
+*.py text eol=lf

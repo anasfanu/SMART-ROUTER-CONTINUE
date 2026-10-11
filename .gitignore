@@ -1,0 +1,53 @@
+# ==========================================
+# ENVIRONMENT VARIABLES (WAJIB JANGAN DI-COMMIT)
+# ==========================================
+.env
+.env.local
+.env.*.local
+
+# ==========================================
+# VIRTUAL ENVIRONMENTS (WAJIB JANGAN DI-COMMIT)
+# ==========================================
+venv/
+ENV/
+env/
+.venv/
+
+# ==========================================
+# PYTHON
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ==========================================
+# IDE & EDITOR (Hanya file user-spesifik)
+# ==========================================
+# Kita biarkan .vscode/ agar tasks.json bisa di-commit
+# Tapi kita ignore folder IDE lain yang bersifat lokal
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# ==========================================
+# OS & SYSTEM
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# LOGS & TEMPORARY
+# ==========================================
+*.log
+logs/
+*.tmp
+*.bak
