@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Smart Router untuk Continue - Dual Provider (Groq Priority + OpenRouter)
-Groq diprioritaskan karena kecepatan LPU, OpenRouter sebagai cadangan.
+Smart Router untuk Continue - Hybrid Dual Provider (Groq + OpenRouter)
+Fix: Per-chunk timeout, proper ReadTimeout handling, client disconnect handling.
 """
 
 import json
@@ -14,10 +14,10 @@ import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pathlib import Path
+from queue import Queue, Empty
 
 # ============ 1. LOAD API KEY ============
 def get_api_key(provider):
-    """Ambil API key dari .env atau input CLI"""
     env_var = f"{provider}_API_KEY"
     try:
         from dotenv import load_dotenv
@@ -34,7 +34,7 @@ def get_api_key(provider):
         if key and len(key) > 10:
             return key
 
-    print(f"\n🔑 SETUP {provider} API KEY")
+    print(f"\n SETUP {provider} API KEY")
     api_key = input(f"👉 Paste {provider} API Key (atau kosongkan untuk skip): ").strip()
     if api_key and len(api_key) > 10:
         local_key_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,6 @@ def get_api_key(provider):
 OPENROUTER_API_KEY = get_api_key("OPENROUTER")
 GROQ_API_KEY = get_api_key("GROQ")
 
-# Debug: Tampilkan status API key
 print("\n" + "=" * 60)
 print(" STATUS API KEY:")
 print(f"   OpenRouter: {'✅ Ter-load' if OPENROUTER_API_KEY else '❌ Tidak ada'}")
@@ -61,6 +60,7 @@ PORT = int(os.getenv("PORT", "8765"))
 HOST = os.getenv("HOST", "127.0.0.1")
 CACHE_DURATION = int(os.getenv("CACHE_DURATION", "3600"))
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
+CHUNK_TIMEOUT = 20  # Timeout per chunk (detik) - ANTI HANG
 
 # ============ 3. STATE GLOBAL ============
 last_request_time = time.time()
@@ -68,80 +68,100 @@ cached_models = None
 cache_timestamp = None
 shutdown_timer = None
 
-# ============ 4. KATEGORI MODEL ============
-CODING_KEYWORDS = [
-    "code", "coder", "coding", "instruct", "chat", "versatile", "instant",
-    "qwq", "r1", "distill", "llama", "mixtral", "gemma", "qwen", "deepseek",
-    "nemotron", "laguna", "inkling", "north-mini"
+# ============ 4. BLACKLIST MODEL LAMBAT ============
+SLOW_MODELS = [
+    "qwen/qwen3.8-27b",
+    "qwen-2.5-coder-32b",
+    "nvidia/nemotron-3-ultra-550b",
+    "nvidia/nemotron-3-super-120b",
 ]
 
 NON_CODING_KEYWORDS = [
     "embed", "rerank", "safety", "image", "vision", "moderation",
     "classifier", "detect", "filter", "whisper", "tts", "speech",
-    "guard", "tokenizer"
+    "guard", "tokenizer", "audio", "stt", "asr"
+]
+
+CODING_KEYWORDS = [
+    "code", "coder", "coding", "instruct", "chat", "versatile", "instant",
+    "qwq", "r1", "distill", "llama", "mixtral", "gemma", "qwen", "deepseek",
+    "nemotron", "laguna", "inkling", "north-mini", "lfm"
 ]
 
 # ============ 5. FUNGSI UTAMA ============
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def is_coding_model(model):
-    """Cek apakah model cocok untuk coding"""
-    model_id = model.get("id", "").lower()
-    name = model.get("name", "").lower()
-    desc = model.get("description", "").lower()
-    combined = f"{model_id} {name} {desc}"
-    
+def is_slow_model(model_id):
+    mid = model_id.lower()
+    for slow in SLOW_MODELS:
+        if slow in mid:
+            return True
+    return False
+
+def is_non_coding(model_id):
+    mid = model_id.lower()
     for kw in NON_CODING_KEYWORDS:
-        if kw in combined:
-            return False
+        if kw in mid:
+            return True
+    return False
+
+def is_coding_model(model, provider):
+    model_id = model.get("id", "")
+    if is_slow_model(model_id):
+        return False
+    if is_non_coding(model_id):
+        return False
+    if provider == "groq":
+        return True
+    name = model.get("name", "").lower()
+    combined = f"{model_id.lower()} {name}"
     for kw in CODING_KEYWORDS:
         if kw in combined:
             return True
     return False
 
 def score_model_for_coding(model, provider):
-    """Beri skor - GROQ DIPRIORITASKAN (bonus +50)"""
     model_id = model.get("id", "").lower()
     name = model.get("name", "").lower()
     combined = f"{model_id} {name}"
     
-    # Base score
-    score = 50
-    
-    # 🚀 GROQ BONUS BESAR (kecepatan LPU) - selalu di atas OpenRouter
     if provider == "groq":
-        score += 50  # Groq selalu menang skor
-    
-    # Bonus model high-tier
-    high_tier = [
-        "llama-3.3-70b", "llama3-70b", "llama-3.1-70b",
-        "mixtral-8x7b", "qwq-32b", "deepseek-r1-distill-llama-70b",
-        "nemotron-3-ultra", "inkling"
-    ]
-    for tier in high_tier:
-        if tier in combined:
+        score = 70
+        if "llama-3.1-70b" in combined or "llama3-70b" in combined:
+            score += 25
+        elif "llama-3.3-70b" in combined:
+            score += 25
+        elif "mixtral-8x7b" in combined:
+            score += 22
+        elif "deepseek-r1-distill-llama-70b" in combined:
             score += 20
-            break
+        elif "qwq-32b" in combined:
+            score += 18
+        elif "gemma2-9b" in combined:
+            score += 15
+        elif "llama-3.1-8b" in combined or "llama3-8b" in combined:
+            score += 12
+        else:
+            score += 5
+    else:
+        score = 50
+        if "nemotron-3-ultra" in combined and "550b" not in combined:
+            score += 25
+        elif "inkling" in combined:
+            score += 22
+        elif "nemotron-3.5" in combined:
+            score += 18
+        elif "laguna" in combined:
+            score += 15
+        elif "north-mini" in combined:
+            score += 12
+        elif ":free" in model_id:
+            score += 5
     
-    # Bonus model medium-tier
-    mid_tier = [
-        "llama-3.1-8b", "llama3-8b", "gemma2-9b", "gemma-7b",
-        "nemotron-3.5", "laguna", "north-mini"
-    ]
-    for tier in mid_tier:
-        if tier in combined:
-            score += 10
-            break
-    
-    # Bonus free tier OpenRouter
-    if ":free" in model_id:
-        score += 5
-    
-    return min(score, 100)
+    return score
 
 def fetch_and_filter_models():
-    """Ambil model dari Groq DULU (prioritas), lalu OpenRouter"""
     global cached_models, cache_timestamp
     
     if cached_models and cache_timestamp:
@@ -150,24 +170,20 @@ def fetch_and_filter_models():
 
     unified_models = []
 
-    #  1. AMBIL DARI GROQ DULU (PRIORITAS UTAMA)
     if GROQ_API_KEY:
-        log("🔍 Mengambil model dari Groq...")
+        log(" Mengambil Model dari Groq...")
         try:
-            resp = requests.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                timeout=15
-            )
+            resp = requests.get("https://api.groq.com/openai/v1/models", 
+                                headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=15)
             resp.raise_for_status()
-            groq_models = resp.json().get("data", [])
-            log(f"   Ditemukan {len(groq_models)} model di Groq")
+            all_groq_models = resp.json().get("data", [])
+            log(f"   📦 Total {len(all_groq_models)} model dari Groq API")
             
-            for m in groq_models:
+            groq_candidates = []
+            for m in all_groq_models:
                 model_id = m.get("id", "")
-                # Filter lebih luas: terima semua model chat/instruct Groq
-                if is_coding_model(m):
-                    unified_models.append({
+                if is_coding_model(m, "groq"):
+                    groq_candidates.append({
                         "id": model_id,
                         "title": f"[GROQ] {model_id}",
                         "score": score_model_for_coding(m, "groq"),
@@ -175,30 +191,28 @@ def fetch_and_filter_models():
                         "api_key": GROQ_API_KEY,
                         "base_url": "https://api.groq.com/openai/v1"
                     })
-            log(f"   ✅ {len([m for m in unified_models if m['provider']=='groq'])} model Groq lolos filter coding")
+            
+            groq_candidates.sort(key=lambda x: x["score"], reverse=True)
+            top_groq = groq_candidates[:5]
+            unified_models.extend(top_groq)
+            log(f"   ✅ {len(top_groq)} model Groq terpilih")
+            for m in top_groq:
+                log(f"      🚀 {m['id']} (Score: {m['score']})")
+                
         except Exception as e:
             log(f"   ❌ Gagal ambil model Groq: {e}")
-    else:
-        log("⚠️ Groq API key tidak ada, skip Groq")
 
-    #  2. AMBIL DARI OPENROUTER (CADANGAN)
     if OPENROUTER_API_KEY:
-        log("🔍 Mengambil model dari OpenRouter...")
+        log("🔍 Mengambil Model Gratis dari OpenRouter...")
         try:
-            resp = requests.get(
-                "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-                timeout=15
-            )
+            resp = requests.get("https://openrouter.ai/api/v1/models", 
+                                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}, timeout=15)
             resp.raise_for_status()
-            or_models = resp.json().get("data", [])
-            log(f"   Ditemukan {len(or_models)} model di OpenRouter")
-            
-            for m in or_models:
+            or_count = 0
+            for m in resp.json().get("data", []):
                 pricing = m.get("pricing", {})
-                prompt_price = str(pricing.get("prompt", "1"))
-                if prompt_price == "0" and ":free" in m.get("id", ""):
-                    if is_coding_model(m):
+                if str(pricing.get("prompt", "1")) == "0" and ":free" in m.get("id", ""):
+                    if is_coding_model(m, "openrouter"):
                         unified_models.append({
                             "id": m["id"],
                             "title": f"[OR] {m.get('name', m['id'])}",
@@ -207,29 +221,26 @@ def fetch_and_filter_models():
                             "api_key": OPENROUTER_API_KEY,
                             "base_url": "https://openrouter.ai/api/v1"
                         })
-            log(f"   ✅ {len([m for m in unified_models if m['provider']=='openrouter'])} model OpenRouter gratis lolos filter")
+                        or_count += 1
+            log(f"   ✅ {or_count} model OpenRouter gratis lolos filter")
         except Exception as e:
             log(f"   ❌ Gagal ambil model OpenRouter: {e}")
 
-    # 3. URUTKAN: Groq di atas (skor lebih tinggi), lalu OpenRouter
     unified_models.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Ambil 12 terbaik
-    cached_models = unified_models[:12]
+    cached_models = unified_models[:15]
     cache_timestamp = datetime.now()
     
     log("\n" + "=" * 60)
-    log(f"🏆 Top {len(cached_models)} Model (Groq Priority):")
+    log(f"🏆 Top {len(cached_models)} Model Pool:")
     log("=" * 60)
     for i, m in enumerate(cached_models, 1):
-        provider_tag = "🚀" if m["provider"] == "groq" else "🌐"
-        log(f"  {i:2}. {provider_tag} [{m['provider'].upper():10}] {m['id']} (Score: {m['score']})")
+        tag = "🚀" if m["provider"] == "groq" else "🌐"
+        log(f"  {i:2}. {tag} [{m['provider'].upper():10}] {m['id']} (Score: {m['score']})")
     log("=" * 60 + "\n")
         
     return cached_models
 
 def optimize_prompt_messages(messages):
-    """Optimasi prompt untuk hemat token"""
     optimized = []
     for msg in messages:
         content = msg.get("content", "")
@@ -241,29 +252,59 @@ def optimize_prompt_messages(messages):
     return optimized
 
 def call_llm(model_info, payload, stream=False):
-    """Panggil API dinamis"""
-    headers = {
-        "Authorization": f"Bearer {model_info['api_key']}",
-        "Content-Type": "application/json"
-    }
+    """Panggil API - raise exception jika timeout, jangan return None"""
+    headers = {"Authorization": f"Bearer {model_info['api_key']}", "Content-Type": "application/json"}
     if model_info['provider'] == 'openrouter':
         headers["HTTP-Referer"] = "http://localhost"
         headers["X-Title"] = "Continue Smart Router"
 
     payload = {**payload, "model": model_info['id']}
     
-    try:
-        resp = requests.post(
-            f"{model_info['base_url']}/chat/completions",
-            headers=headers, json=payload, stream=stream, timeout=120
-        )
-        return resp
-    except Exception as e:
-        log(f"❌ Error panggil {model_info['id']}: {e}")
-        return None
+    # Raise exception jika timeout (biar di-handle di caller)
+    resp = requests.post(
+        f"{model_info['base_url']}/chat/completions", 
+        headers=headers, json=payload, stream=stream, timeout=(5, 30)
+    )
+    return resp
+
+def stream_with_chunk_timeout(resp, timeout_seconds):
+    """
+    Wrapper untuk iter_lines() dengan timeout per chunk.
+    FIX BUG #1: Anti-hang jika model kirim data lambat.
+    """
+    chunk_queue = Queue(maxsize=100)
+    stop_event = threading.Event()
+    
+    def reader_thread():
+        try:
+            for line in resp.iter_lines():
+                if stop_event.is_set():
+                    break
+                if line:
+                    chunk_queue.put(line)
+        except Exception as e:
+            chunk_queue.put(("ERROR", str(e)))
+        finally:
+            chunk_queue.put(None)  # Signal selesai
+    
+    thread = threading.Thread(target=reader_thread, daemon=True)
+    thread.start()
+    
+    while not stop_event.is_set():
+        try:
+            item = chunk_queue.get(timeout=timeout_seconds)
+            if item is None:
+                break  # Stream selesai
+            if isinstance(item, tuple) and item[0] == "ERROR":
+                raise Exception(item[1])
+            yield item
+        except Empty:
+            raise TimeoutError(f"Chunk timeout setelah {timeout_seconds} detik")
+    
+    stop_event.set()
+    thread.join(timeout=2)
 
 def smart_route(payload, stream=False):
-    """Route dengan stateful continuation"""
     global last_request_time
     last_request_time = time.time()
     
@@ -272,87 +313,91 @@ def smart_route(payload, stream=False):
         log("⚠️ Tidak ada model tersedia!")
         return None
 
-    original_messages = payload.get("messages", [])
-    optimized_messages = optimize_prompt_messages(original_messages)
-    accumulated_response = ""
+    optimized_messages = optimize_prompt_messages(payload.get("messages", []))
 
-    for i, model in enumerate(models):
-        provider_emoji = "🚀" if model["provider"] == "groq" else ""
-        log(f"🎯 Mencoba #{i+1} {provider_emoji} {model['id']}")
-        
-        current_messages = optimized_messages.copy()
-        
-        if accumulated_response:
-            log(f"💡 Melanjutkan dari {len(accumulated_response)} karakter...")
-            current_messages.append({"role": "assistant", "content": accumulated_response})
-            current_messages.append({
-                "role": "user",
-                "content": "[SYSTEM: Lanjutkan dari titik terakhir. JANGAN ulangi bagian yang sudah ditulis.]"
-            })
-
-        try:
-            resp = call_llm(model, {"messages": current_messages, "stream": stream}, stream)
+    if not stream:
+        for model in models:
+            try:
+                resp = call_llm(model, {"messages": optimized_messages, "stream": False}, False)
+                if resp and resp.status_code == 200:
+                    log(f"✅ Berhasil (Non-stream): {model['id']}")
+                    return resp
+                elif resp:
+                    log(f"⚠️ {model['id']} gagal (Status {resp.status_code}), rotasi...")
+            except requests.exceptions.Timeout:
+                log(f"⏱️ {model['id']} timeout, rotasi...")
+            except Exception as e:
+                log(f"❌ {model['id']} error: {e}, rotasi...")
+        return None
+    else:
+        def stream_generator():
+            accumulated_response = ""
+            model_idx = 0
             
-            if resp and resp.status_code == 200:
-                log(f"✅ Berhasil: {model['id']}")
-                if stream:
-                    def stream_with_state():
-                        nonlocal accumulated_response
-                        try:
-                            for line in resp.iter_lines():
-                                if line:
-                                    line_str = line.decode('utf-8')
-                                    yield line_str + "\n"
-                                    if line_str.startswith("data: "):
-                                        json_str = line_str[6:]
-                                        if json_str.strip() == "[DONE]": break
-                                        try:
-                                            data = json.loads(json_str)
-                                            delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                            if delta: accumulated_response += delta
-                                        except: pass
-                        except Exception as e:
-                            log(f"⚠️ Stream terputus di {model['id']}: {e}")
-                            raise Exception("Stream interrupted")
-                    return stream_with_state()
-                else:
-                    try:
-                        resp_json = resp.json()
-                        accumulated_response = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        return resp
-                    except Exception as e:
-                        log(f"️ Gagal parse JSON: {e}")
+            while model_idx < len(models):
+                model = models[model_idx]
+                log(f"🎯 Streaming dengan model #{model_idx+1}: {model['id']}")
+                
+                current_messages = optimized_messages.copy()
+                if accumulated_response:
+                    log(f"💡 Melanjutkan dari {len(accumulated_response)} karakter...")
+                    current_messages.append({"role": "assistant", "content": accumulated_response})
+                    current_messages.append({"role": "user", "content": "[SYSTEM: Lanjutkan dari titik terakhir. JANGAN ulangi bagian yang sudah ditulis.]"})
+                
+                try:
+                    resp = call_llm(model, {"messages": current_messages, "stream": True}, True)
+                    
+                    if resp.status_code != 200:
+                        log(f"️ {model['id']} gagal (Status {resp.status_code}), rotasi...")
+                        model_idx += 1
                         continue
-            elif resp and resp.status_code in [429, 500, 502, 503]:
-                log(f"⚠️ {model['id']} rate-limited/down ({resp.status_code}), rotasi...")
-                continue
-            else:
-                log(f"️ {model['id']} gagal ({resp.status_code if resp else 'N/A'}), rotasi...")
-                continue
-        except Exception as e:
-            log(f"❌ {model['id']} error: {e}. Lanjut ke model berikutnya...")
-            continue
+                    
+                    log(f"✅ Berhasil stream: {model['id']}")
+                    stream_completed = False
+                    
+                    # FIX BUG #1: Gunakan chunk timeout wrapper
+                    for line in stream_with_chunk_timeout(resp, CHUNK_TIMEOUT):
+                        line_str = line.decode('utf-8').strip()
+                        
+                        if line_str.startswith('data: '):
+                            json_str = line_str[6:]
+                            if json_str == '[DONE]':
+                                yield "data: [DONE]\n\n"
+                                stream_completed = True
+                                break
+                            try:
+                                data = json.loads(json_str)
+                                delta = data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                if delta:
+                                    accumulated_response += delta
+                                yield f"data: {json.dumps(data)}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+                    
+                    if stream_completed:
+                        return
+                    else:
+                        log(f"⚠️ Stream {model['id']} terputus, rotasi...")
+                        model_idx += 1
+                        
+                except TimeoutError as e:
+                    log(f"⏱️ {model['id']} hang ({e}), rotasi paksa...")
+                    model_idx += 1
+                except requests.exceptions.Timeout:
+                    log(f"️ {model['id']} timeout, rotasi...")
+                    model_idx += 1
+                except Exception as e:
+                    log(f"❌ {model['id']} error: {e}. Rotasi...")
+                    model_idx += 1
+            
+            yield "data: [DONE]\n\n"
 
-    # Fallback terakhir
-    if OPENROUTER_API_KEY:
-        log("🆘 Semua gagal, coba openrouter/free...")
-        try:
-            fallback = optimized_messages[-5:]
-            if accumulated_response:
-                fallback.append({"role": "assistant", "content": accumulated_response})
-                fallback.append({"role": "user", "content": "[SYSTEM: Lanjutkan dari sini]"})
-            return call_llm(
-                {"id": "openrouter/free", "api_key": OPENROUTER_API_KEY, 
-                 "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"},
-                {"messages": fallback, "stream": stream}, stream
-            )
-        except Exception as e:
-            log(f"❌ Fallback gagal: {e}")
-    return None
+        return stream_generator()
 
 def reset_idle_timer():
     global shutdown_timer
-    if shutdown_timer: shutdown_timer.cancel()
+    if shutdown_timer:
+        shutdown_timer.cancel()
     shutdown_timer = threading.Timer(IDLE_TIMEOUT, shutdown_server)
     shutdown_timer.daemon = True
     shutdown_timer.start()
@@ -360,11 +405,12 @@ def reset_idle_timer():
 def shutdown_server():
     idle_time = time.time() - last_request_time
     if idle_time >= IDLE_TIMEOUT:
-        log(f"💤 Idle {IDLE_TIMEOUT}s, shutdown...")
+        log(f"💤 Idle {IDLE_TIMEOUT}s, shutdown server...")
         os._exit(0)
 
 class SmartHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass
+    def log_message(self, format, *args):
+        pass
     
     def do_POST(self):
         global last_request_time
@@ -373,26 +419,45 @@ class SmartHandler(BaseHTTPRequestHandler):
         
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
-        try: payload = json.loads(body)
-        except: self.send_error(400, "Invalid JSON"); return
+        try:
+            payload = json.loads(body)
+        except:
+            self.send_error(400, "Invalid JSON")
+            return
         
         stream = payload.get("stream", False)
-        resp = smart_route(payload, stream)
+        result = smart_route(payload, stream)
         
-        if not resp: self.send_error(503, "All models failed"); return
-        
-        self.send_response(resp.status_code)
-        for key in ["content-type"]:
-            if key in resp.headers: self.send_header(key, resp.headers[key])
-        self.end_headers()
+        if not result:
+            self.send_error(503, "All models failed")
+            return
         
         if stream:
-            for chunk in resp.iter_content(chunk_size=None):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+            self.send_response(200)
+            self.send_header("Content-type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            
+            try:
+                for chunk in result:
+                    if chunk:
+                        if isinstance(chunk, str):
+                            self.wfile.write(chunk.encode('utf-8'))
+                        else:
+                            self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log("⚠️ Client disconnect (user stop)")
+            except Exception as e:
+                log(f"❌ Error saat streaming: {e}")
         else:
-            self.wfile.write(resp.content)
+            self.send_response(result.status_code)
+            for key in ["content-type"]:
+                if key in result.headers:
+                    self.send_header(key, result.headers[key])
+            self.end_headers()
+            self.wfile.write(result.content)
 
     def do_GET(self):
         global last_request_time
@@ -410,14 +475,16 @@ class SmartHandler(BaseHTTPRequestHandler):
                 "groq_count": len([m for m in models if m["provider"]=="groq"]),
                 "openrouter_count": len([m for m in models if m["provider"]=="openrouter"])
             }).encode())
-        else: self.send_error(404)
+        else:
+            self.send_error(404)
 
 def main():
     log("=" * 60)
-    log("🚀 Smart Router: Groq Priority + OpenRouter Fallback")
+    log("🚀 Smart Router: Hybrid Groq + OpenRouter")
     log("=" * 60)
     log(f"📍 Server: http://{HOST}:{PORT}")
     log(f" Auto-stop: {IDLE_TIMEOUT}s idle")
+    log(f"⏱️ Chunk timeout: {CHUNK_TIMEOUT}s (anti-hang)")
     
     fetch_and_filter_models()
     
