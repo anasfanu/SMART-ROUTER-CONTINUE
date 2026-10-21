@@ -225,6 +225,75 @@ Pada lingkungan desktop yang mendukungnya, kamu juga dapat menjalankan file ters
 
 ---
 
+## 🧪 Pengujian Lokal (Tanpa API Key)
+
+Project ini dilengkapi **test suite otomatis** yang dapat dijalankan langsung di mesinmu — tanpa perlu API key asli dan tanpa koneksi ke Groq/OpenRouter. Cocok untuk memverifikasi hasil perubahan kode sebelum dipakai bersama Continue.dev.
+
+### 📄 File Test
+
+| File | Fungsi |
+|---|---|
+| `test_mock_upstream.py` | Mock server OpenAI-compatible lokal. Menjalankan 2 instance dalam satu proses: **port 9901 = upstream sehat** (echo respons SSE/JSON normal) dan **port 9902 = upstream sakit** (respons selalu hang, untuk menguji mekanisme rotasi model). |
+| `test_router.py` | Test suite end-to-end. Men-mock daftar model provider, menjalankan `smart_router.py` sungguhan di **port 8799**, lalu menguji seluruh perilaku router lewat HTTP nyata. Otomatis men-start & menghentikan mock upstream sendiri. |
+
+### ▶️ Cara Menjalankan
+
+```bash
+# dari folder project
+python3 test_router.py        # Windows bisa pakai: python test_router.py
+```
+
+Output berakhir dengan ringkasan, contoh:
+
+```text
+===== HASIL =====
+Lulus: 20 | Gagal: 0
+```
+
+Exit code `0` berarti semua test lulus; exit code `1` ada test yang gagal.
+
+> 💡 Kamu cukup menjalankan `test_router.py` — file itu otomatis memanggil `test_mock_upstream.py`. Tidak perlu menjalankannya terpisah.
+
+### ✅ Yang Diuji
+
+| Test | Perilaku yang diverifikasi |
+|---|---|
+| T0 | Filter harga OpenRouter berbasis angka float (`pricing.prompt = 0.0` tetap dianggap gratis) + kuota per-provider di model pool |
+| T1, T12 | `GET /health` merespons cepat tanpa hang (header `Content-Length` benar) |
+| T2 | `GET /v1/models` tidak membocorkan API key |
+| T3, T4 | Routing eksplisit: path tak dikenal → 404 JSON; body invalid → 400 JSON |
+| T5, T5b | Chat non-stream berhasil; `temperature` & `max_tokens` dari client diteruskan ke upstream |
+| T6 | Streaming SSE utuh sampai `data: [DONE]` |
+| T7, T7b, T7c | Content multimodal (list) dipertahankan; default `temperature=0.4` terkirim saat client tidak mengatur; temperature client tidak ditimpa |
+| T8 | `/health` tetap responsif selama streaming berjalan (ThreadingHTTPServer) |
+| T9, T9b | Rotasi otomatis saat model pertama hang → stream tetap selesai; cache model tidak di-fetch ulang tiap request |
+| T10, T10b | Semua model gagal → SSE error event + `[DONE]` (mode stream) dan 503 JSON seragam (mode non-stream) |
+| T11 | Hasil filter kosong ikut ter-cache (tidak memicu loop refetch ke provider) |
+
+### 🛠️ Troubleshooting Test
+
+| Masalah | Solusi |
+|---|---|
+| `OSError: Address already in use` (port 8799/9901/9902) | Matikan proses sisa terlebih dahulu: Linux/macOS `pkill -f smart_router; pkill -f test_mock_upstream` — Windows `taskkill /F /IM python.exe` atau tutup terminal/jendela lama. |
+| Test tampak menggantung | Pastikan tidak ada instance `smart_router.py` produksi yang memakai port yang sama; ubah sementara via env `PORT`. |
+| `ModuleNotFoundError: requests` | Install dependencies: `python -m pip install -r requirements.txt`. |
+
+### 🔎 Smoke Test Manual (dengan API key asli)
+
+Setelah test suite lulus, kamu bisa mencoba terhadap provider sungguhan:
+
+```bash
+python3 smart_router.py            # jalankan router normal (terminal lain)
+
+curl http://127.0.0.1:8765/health  # cek hidup
+curl http://127.0.0.1:8765/v1/models   # cek model pool terpilih
+curl -N http://127.0.0.1:8765/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"tulis fungsi fibonacci"}],"stream":true}'
+```
+
+---
+
 ## 🔌 Integrasi dengan Continue.dev
 
 Setelah Smart Router berjalan, konfigurasikan Continue.dev agar terhubung ke endpoint dan port yang disediakan oleh aplikasi ini.
