@@ -51,3 +51,5 @@ desktop.ini
 logs/
 *.tmp
 *.bak
+# PID file skrip start/stop router
+smart_router.pid

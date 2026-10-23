@@ -8,7 +8,7 @@ Revisi (hasil inspeksi bug):
 - stream_with_chunk_timeout: put() non-blocking + resp.close() (anti thread/socket leak)
 - Payload client diteruskan utuh (temperature, max_tokens, tools, dst.)
 - SSE error event saat semua model gagal; priming sebelum kirim header 200
-- API key disimpan dengan chmod 600, tidak disisipkan ke objek model yang diekspos
+- API key HANYA dibaca dari file .env (tanpa prompt CLI)
 - Filter harga numerik, cache cek `is not None`, except spesifik
 - Routing eksplisit: POST /v1/chat/completions | GET /health | GET /v1/models
 """
@@ -26,38 +26,36 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue, Empty, Full
 
-# ============ 1. LOAD API KEY ============
+# ============ 1. LOAD API KEY (HANYA dari file .env — tanpa prompt CLI) ============
+def load_env_file(path=".env"):
+    """Parser .env sederhana (tanpa dependensi wajib python-dotenv)."""
+    candidates = []
+    try:
+        candidates.append(Path.cwd() / path)          # 1) cwd (konsisten dgn perilaku dotenv standar)
+    except OSError:
+        pass
+    candidates.append(Path(__file__).resolve().parent / path)  # 2) di samping skrip (klik dari file manager)
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
+        return
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip("'\"")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
 def get_api_key(provider):
     env_var = f"{provider}_API_KEY"
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv(env_var)
-        if api_key and not api_key.startswith("your-") and len(api_key) > 10:
-            return api_key
-    except ImportError:
-        pass
-
-    local_key_path = Path.home() / ".smart-router-continue" / f"{provider.lower()}_key.txt"
-    if local_key_path.exists():
-        key = local_key_path.read_text().strip()
-        if key and len(key) > 10:
-            return key
-
-    # Non-interactive (mis. pythonw/background): jangan pernah menunggu input()
-    if not sys.stdin or not sys.stdin.isatty():
-        return None
-
-    print(f"\n SETUP {provider} API KEY")
-    api_key = input(f"👉 Paste {provider} API Key (atau kosongkan untuk skip): ").strip()
-    if api_key and len(api_key) > 10:
-        local_key_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(local_key_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(api_key)
+    api_key = os.getenv(env_var)
+    if api_key and not api_key.startswith("your-") and len(api_key) > 10:
         return api_key
     return None
 
+load_env_file()
 OPENROUTER_API_KEY = get_api_key("OPENROUTER")
 GROQ_API_KEY = get_api_key("GROQ")
 
