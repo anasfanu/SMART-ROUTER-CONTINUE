@@ -1,11 +1,7 @@
 @echo off
 title Smart Router - Stop (Windows)
-rem Smart Router - Stop (Windows) - klik dua kali untuk kill router + test + mock
-
-echo 🛑 Menghentikan Smart Router, test, dan mock...
-wmic process where "commandline like '%%smart_router.py%%'" delete >nul 2>&1
-wmic process where "commandline like '%%test_mock_upstream.py%%'" delete >nul 2>&1
-wmic process where "commandline like '%%test_router.py%%'" delete >nul 2>&1
-echo ✅ Selesai. Semua proses dibersihkan.
-echo.
+rem Wrapper tipis. SELURUH logika stop ada di smart_router.py
+rem (kill via PID file + pembersihan sisa proses router/test/mock).
+cd /d "%~dp0"
+python smart_router.py --stop
 pause

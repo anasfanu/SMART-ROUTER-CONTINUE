@@ -11,16 +11,34 @@ Revisi (hasil inspeksi bug):
 - API key HANYA dibaca dari file .env (tanpa prompt CLI)
 - Filter harga numerik, cache cek `is not None`, except spesifik
 - Routing eksplisit: POST /v1/chat/completions | GET /health | GET /v1/models
+
+Revisi (penyatuan launcher — start/stop tidak lagi diduplikasi di .sh & .bat):
+- smart_router.py adalah SATU-SATUNYA entry point lintas platform.
+- Menjalankan langsung (double-click / python smart_router.py) = "start":
+  otomatis memilih interpreter yang benar (venv bila ada, pythonw tanpa konsol
+  di Windows), lalu spawn instance router SELANJUTNYA sebagai proses background
+  (log + PID file dikelola Python, bukan shell/batch).
+- Instance background memasang signal handler (SIGINT/SIGTERM/Ctrl+Close):
+  saat jendela/apps ditutup ("close") = "stop", PID file dibersihkan dan proses
+  mati rapi. Stop manual juga tersedia: `python smart_router.py --stop`
+  (lintas OS — pengganti stop_router.sh/.bat).
+- Kode start/stop Linux & Windows disatukan di sini; .sh/.bat lama hanya jadi
+  wrapper satu baris (tidak ada lagi logika ganda yang harus dirawat 2x).
 """
 
+import atexit
 import json
 import time
 import threading
 import requests
+import signal
+import subprocess
 import sys
 import os
 import re
 import copy
+import ctypes
+import platform
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,34 +73,339 @@ def get_api_key(provider):
         return api_key
     return None
 
+
 load_env_file()
-OPENROUTER_API_KEY = get_api_key("OPENROUTER")
-GROQ_API_KEY = get_api_key("GROQ")
+
+# ============ 1b. KONFIGURASI & LAUNCHER (satukan fungsi start_router.* & stop_router.*) ============
+PORT = int(os.getenv("PORT", "8765"))
+HOST = os.getenv("HOST", "127.0.0.1")
+CACHE_DURATION = int(os.getenv("CACHE_DURATION", "3600"))
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
+# (UPSTREAM_* & CHUNK_TIMEOUT dipakai oleh kode server — bagian server masih di bawah)
+
+IS_WINDOWS = platform.system() == "Windows"
+PROJECT_DIR = Path(__file__).resolve().parent
+LOG_FILE = PROJECT_DIR / "smart_router.log"
+PID_FILE = PROJECT_DIR / "smart_router.pid"
+BG_FLAG_ENV = "SMART_ROUTER_BG"   # diset saat launcher men-spawn instance background
+
+
+def is_already_backgrounded():
+    """True bila proses ini adalah instance router background yang di-spawn launcher."""
+    return os.environ.get(BG_FLAG_ENV) == "1"
+
+
+def pid_is_alive(pid):
+    """Cek apakah PID masih hidup, lintas OS (pengganti `kill -0` bash)."""
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def read_pidfile():
+    """Baca PID dari file; validasi isi & kematiannya (auto-cleanup file basi)."""
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid and not pid_is_alive(pid):
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+        pid = 0
+    return pid
+
+
+def write_pidfile():
+    try:
+        PID_FILE.write_text(str(os.getpid()))
+    except OSError as e:
+        print(f"⚠️ Gagal menulis PID file: {e}", flush=True)
+
+
+def cleanup_pidfile():
+    """Hanya hapus bila berisi PID kita sendiri (hindari balapan antar-instance)."""
+    try:
+        if int(PID_FILE.read_text().strip()) == os.getpid():
+            PID_FILE.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def _terminate_win(pid):
+    """TaskKill satu tree proses; output ditangkap agar tidak ada console popup."""
+    try:
+        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return True
+        print(f"⚠️ taskkill PID {pid} rc={r.returncode}: {(r.stderr or r.stdout).strip()}",
+              flush=True)
+    except Exception as e:
+        print(f"⚠️ taskkill PID {pid} gagal: {e}", flush=True)
+    return False
+
+
+def _terminate_posix(pid):
+    """SIGTERM dulu (graceful), lalu SIGKILL bila membandel (pengganti `kill` bash)."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        print(f"⚠️ Tidak berhak menghentikan PID {pid} (proses milik user lain?)",
+              flush=True)
+        return False
+    for _ in range(20):                    # tunggu maks ~5 detik
+        if not pid_is_alive(pid):
+            return True
+        time.sleep(0.25)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    return not pid_is_alive(pid)
+
+
+def terminate_router(pid):
+    """SATU implementasi stop untuk semua OS — dipakai jalur restart, --stop, dan close."""
+    if IS_WINDOWS:
+        return _terminate_win(pid)
+    return _terminate_posix(pid)
+
+
+def run_stop_cli():
+    """Padanan stop_router.sh/.bat dalam Python: kill router + sisa proses test/mock."""
+    print("🛑 Menghentikan Smart Router (+ sisa proses test/mock)...")
+    stopped = False
+    pid = read_pidfile()
+    if pid and terminate_router(pid):
+        print(f"🛑 Smart Router dihentikan (PID {pid}).")
+        stopped = True
+    else:
+        print("ℹ️  Tidak ada Smart Router yang berjalan (via PID file).")
+    # Fallback: bersihkan proses yang dijalankan manual tanpa PID file
+    killed_leftovers = False
+    if IS_WINDOWS:
+        for pat in ("smart_router.py", "test_mock_upstream.py", "test_router.py"):
+            try:
+                r = subprocess.run(
+                    ["wmic", "process", "where", f"commandline like '%{pat}%'", "delete"],
+                    capture_output=True, text=True, timeout=15)
+                if "deleting" in (r.stdout or "").lower():
+                    killed_leftovers = True
+            except Exception:
+                pass
+    else:
+        for pat in ("smart_router.py", "test_mock_upstream.py", "test_router.py"):
+            try:
+                r = subprocess.run(["pkill", "-f", pat], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    killed_leftovers = True
+            except Exception:
+                pass
+    if killed_leftovers:
+        print("🧹 Sisa proses router/test/mock dibersihkan.")
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    print("✅ Selesai. Semua proses dibersihkan." if (stopped or killed_leftovers)
+          else "✅ Tidak ada yang perlu dihentikan.")
+    return 0
+
+
+def pick_interpreter():
+    """Padanan logika venv di .sh/.bat: pakai venv bila ada; pythonw (tanpa konsol) di Windows."""
+    exe = Path(sys.executable).name.lower()
+    in_venv = (getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+               or bool(os.environ.get("VIRTUAL_ENV")))
+    if not in_venv:
+        win_py = PROJECT_DIR / "venv" / "Scripts" / "python.exe"
+        nix_py = PROJECT_DIR / "venv" / "bin" / "python"
+        candidate = win_py if IS_WINDOWS else nix_py
+        if candidate.exists():
+            return str(candidate)
+    if IS_WINDOWS and exe.startswith("python") and not exe.startswith("pythonw"):
+        w = Path(sys.executable).with_name("pythonw.exe")
+        if w.exists():
+            return str(w)
+    return sys.executable
+
+
+def ensure_dependencies():
+    """Pengganti `pip install -q -r requirements.txt` di skrip lama (best-effort)."""
+    req = PROJECT_DIR / "requirements.txt"
+    if not req.exists():
+        return
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req)],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            print("⚠️ Gagal install dependency (mungkin offline). Mencoba tetap jalan...",
+                  flush=True)
+    except Exception:
+        print("⚠️ pip gagal/times out (mungkin offline). Mencoba tetap jalan...", flush=True)
+
+
+def health_ok(timeout=2.0):
+    try:
+        return requests.get(f"http://{HOST}:{PORT}/health", timeout=timeout).status_code == 200
+    except Exception:
+        return False
+
+
+def spawn_instance():
+    """Spawn SATU instance router sebagai proses background (pengganti nohup / start)."""
+    env = dict(os.environ)
+    env[BG_FLAG_ENV] = "1"   # penanda: instance ini jalur SERVER, bukan launcher CLI
+    kwargs = {}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x08) | \
+                                  getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+    else:
+        kwargs["start_new_session"] = True
+    with open(LOG_FILE, "ab") as logf:
+        proc = subprocess.Popen([pick_interpreter(), str(PROJECT_DIR / "smart_router.py")],
+                                cwd=str(PROJECT_DIR), stdout=logf, stderr=logf,
+                                stdin=subprocess.DEVNULL, env=env, **kwargs)
+    try:
+        PID_FILE.write_text(str(proc.pid))
+    except OSError:
+        pass
+    return proc
+
+
+def run_start_cli():
+    """
+    Padanan start_router.sh/.bat dalam Python (double-click friendly, lintas OS):
+      1) Validasi .env & API key   2) Dependency   3) Kill instance lama (restart bersih)
+      4) Spawn instance background 5) Tunggu sehat & laporkan URL
+    Instance background memasang signal handler sendiri -> saat apps/jendela ditutup,
+    proses ikut mati rapi (PID file dibersihkan via atexit).
+    Catatan: launcher TIDAK meng-import dirinya sendiri — cek key cukup via parser .env.
+    """
+    print("🚀 Starting Smart Router...")
+
+    if not (PROJECT_DIR / ".env").exists():
+        print("❌ File .env tidak ditemukan!")
+        print("💡 Salin .env.example ke .env lalu isi API key Anda:")
+        print("   cp .env.example .env" if not IS_WINDOWS else "   copy .env.example .env")
+        input("Tekan Enter untuk keluar...")
+        return 1
+
+    if not (get_api_key("GROQ") or get_api_key("OPENROUTER")):
+        print("❌ ERROR: Minimal satu API Key harus diisi (Groq dan/atau OpenRouter) di .env!")
+        input("Tekan Enter untuk keluar...")
+        return 1
+
+    ensure_dependencies()
+
+    old = read_pidfile()
+    if old:
+        print(f"♻️  Server sudah jalan (PID {old}), restart bersih...")
+        terminate_router(old)
+
+    proc = spawn_instance()
+    deadline = time.time() + 10
+    healthy = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if health_ok():
+            healthy = True
+            break
+        time.sleep(0.5)
+
+    if healthy:
+        print(f"✅ Smart Router jalan! PID {proc.pid} → http://{HOST}:{PORT}")
+        print(f"💡 Log: {LOG_FILE.name} | Auto-stop setelah {IDLE_TIMEOUT}s idle.")
+        print("   Stop manual: python smart_router.py --stop (atau double-click stop_router.*)")
+        print("   Menutup proses ini (Ctrl+C / tutup jendela) juga menghentikan router.")
+    else:
+        print("❌ Gagal start. Cek log:")
+        try:
+            tail = LOG_FILE.read_text(errors="replace").splitlines()[-8:]
+            print("\n".join(tail))
+        except OSError:
+            print("(log belum tersedia)")
+        if proc.poll() is None:
+            terminate_router(proc.pid)
+        cleanup_pidfile()
+        input("Tekan Enter untuk keluar...")
+        return 1
+    return 0
+
+
+def install_shutdown_handlers():
+    """Jalur STOP saat apps/jendela ditutup — aktif hanya pada instance background."""
+    atexit.register(cleanup_pidfile)
+
+    def _on_signal(signum, frame):
+        print(f"🛑 Sinyal {signal.Signals(signum).name} diterima (apps ditutup / stop).",
+              flush=True)
+        cleanup_pidfile()
+        os._exit(0)   # langsung mati: serve_forever() tak bisa di-interrupt rapi
+
+    wanted = [signal.SIGINT, signal.SIGTERM]
+    if IS_WINDOWS:
+        if hasattr(signal, "SIGBREAK"):     # Ctrl+Close pada jendela konsol
+            wanted.append(signal.SIGBREAK)
+    else:
+        wanted.append(signal.SIGHUP)
+    for s in wanted:
+        try:
+            signal.signal(s, _on_signal)
+        except (OSError, ValueError):
+            pass  # beberapa sinyal tak tersedia/boleh dipasang — lanjutkan yang lain
+
 
 # ====== FUNGSI: JALAN DENGAN 1 ATAU 2 API KEY (auto-filter, tanpa perlu pilih apa pun) ======
 # Provider yang tidak punya key otomatis DILEWATI (di-filter) — bukan error, bukan prompt.
 # 1 key  -> router tetap jalan penuh dengan pool dari provider tsb.
 # 2 key  -> keduanya digabung seperti biasa.
+OPENROUTER_API_KEY = get_api_key("OPENROUTER")
+GROQ_API_KEY = get_api_key("GROQ")
 ACTIVE_PROVIDERS = [p for p, k in (("groq", GROQ_API_KEY), ("openrouter", OPENROUTER_API_KEY)) if k]
 
-print("\n" + "=" * 60)
-print(" STATUS API KEY (mode single-key didukung):")
-print(f"   OpenRouter: {'✅ Ter-load' if OPENROUTER_API_KEY else '⏭️  Tidak ada (dilewati otomatis)'}")
-print(f"   Groq:       {'✅ Ter-load' if GROQ_API_KEY else '⏭️  Tidak ada (dilewati otomatis)'}")
-print(f"   Provider aktif: {', '.join(p.upper() for p in ACTIVE_PROVIDERS) or '-'}")
-if len(ACTIVE_PROVIDERS) == 1:
-    print(f"   ℹ️  Hanya 1 key terdeteksi → router berjalan penuh dengan pool {ACTIVE_PROVIDERS[0].upper()} saja.")
-print("=" * 60 + "\n")
+# Status & validasi key dicetak HANYA oleh jalur server (di-spawn launcher ATAU
+# diimpor test) — supaya launcher CLI tidak mencetak hal yang sama dua kali.
+if is_already_backgrounded() or __name__ != "__main__":
+    print("\n" + "=" * 60)
+    print(" STATUS API KEY (mode single-key didukung):")
+    print(f"   OpenRouter: {'✅ Ter-load' if OPENROUTER_API_KEY else '⏭️  Tidak ada (dilewati otomatis)'}")
+    print(f"   Groq:       {'✅ Ter-load' if GROQ_API_KEY else '⏭️  Tidak ada (dilewati otomatis)'}")
+    print(f"   Provider aktif: {', '.join(p.upper() for p in ACTIVE_PROVIDERS) or '-'}")
+    if len(ACTIVE_PROVIDERS) == 1:
+        print(f"   ℹ️  Hanya 1 key terdeteksi → router berjalan penuh dengan pool {ACTIVE_PROVIDERS[0].upper()} saja.")
+    print("=" * 60 + "\n")
 
 if not ACTIVE_PROVIDERS:
     print("❌ ERROR: Minimal satu API Key harus diisi (Groq dan/atau OpenRouter)!")
     sys.exit(1)
 
-# ============ 2. KONFIGURASI ============
-PORT = int(os.getenv("PORT", "8765"))
-HOST = os.getenv("HOST", "127.0.0.1")
-CACHE_DURATION = int(os.getenv("CACHE_DURATION", "3600"))
-IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
+# ============ 2b. KONFIGURASI SERVER (sisa) ============
 UPSTREAM_CONNECT_TIMEOUT = 5    # connect timeout (detik)
 UPSTREAM_READ_TIMEOUT = 45      # read timeout per-read (harus > CHUNK_TIMEOUT)
 CHUNK_TIMEOUT = int(os.getenv("CHUNK_TIMEOUT", "20"))  # Timeout per chunk (detik) - ANTI HANG
@@ -554,7 +877,8 @@ def shutdown_server():
         return
     if time.time() - last_request_time >= IDLE_TIMEOUT:
         log(f"💤 Idle {IDLE_TIMEOUT}s, shutdown server...")
-        os._exit(0)
+        # keluar RAPI (bukan os._exit) agar atexit ikut jalan -> PID file dibersihkan
+        raise SystemExit(0)
 
 class SmartHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -683,6 +1007,12 @@ class SmartHandler(BaseHTTPRequestHandler):
             self.send_json_error(404, f"Unknown endpoint: {self.path}")
 
 def main():
+    """Jalankan server router. Dipanggil sebagai __main__ (launcher spawn diri sendiri)
+    ATAU diimpor test_router.py — keduanya jalur SERVER, bukan launcher CLI."""
+    # STOP saat apps ditutup: pasang signal handler + auto-cleanup PID file.
+    install_shutdown_handlers()
+    write_pidfile()   # selalu tulis/refresh PID kita agar --stop & restart tahu PID aktif
+
     log("=" * 60)
     log("🚀 Smart Router: Hybrid Groq + OpenRouter")
     log("=" * 60)
@@ -698,9 +1028,19 @@ def main():
     try:
         log("✅ Server siap! Continue bisa mulai digunakan.")
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         log("\n👋 Server dimatikan manual")
         server.server_close()
 
+
 if __name__ == "__main__":
-    main()
+    # Dispatcher tunggal lintas OS — SATU tempat untuk semua perilaku start/stop:
+    #   python smart_router.py          -> START (launcher: spawn background + health check)
+    #   python smart_router.py --stop   -> STOP  (pengganti stop_router.sh / .bat)
+    #   SMART_ROUTER_BG=1 ...           -> instance SERVER itu sendiri (di-spawn launcher)
+    if os.environ.get(BG_FLAG_ENV) == "1":
+        main()
+    elif "--stop" in sys.argv[1:]:
+        sys.exit(run_stop_cli())
+    else:
+        sys.exit(run_start_cli())
