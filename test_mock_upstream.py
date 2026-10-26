@@ -5,6 +5,7 @@ Dua instance dijalankan dalam satu proses:
   - port 9902 : upstream SAKIT (chat/completions selalu hang > chunk timeout)
 """
 import sys, json, threading, time
+import os, tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -24,13 +25,13 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
         # simpan payload terakhir utk diverifikasi test
-        with open("/tmp/last_payload.json","w") as f: json.dump(body,f)
+        with open(os.path.join(tempfile.gettempdir(), "last_payload.json"),"w") as f: json.dump(body,f)
         # catat jumlah panggilan ke healthy-upstream (utuk uji cache T9)
         try:
-            n = int(open("/tmp/hit_count.txt").read())
+            n = int(open(os.path.join(tempfile.gettempdir(), "hit_count.txt")).read())
         except Exception:
             n = 0
-        with open("/tmp/hit_count.txt","w") as f: f.write(str(n+1))
+        with open(os.path.join(tempfile.gettempdir(), "hit_count.txt"),"w") as f: f.write(str(n+1))
         if self.path.endswith("/fail"):
             self.send_error(500); return
         if body.get("stream"):

@@ -410,6 +410,11 @@ UPSTREAM_CONNECT_TIMEOUT = 5    # connect timeout (detik)
 UPSTREAM_READ_TIMEOUT = 45      # read timeout per-read (harus > CHUNK_TIMEOUT)
 CHUNK_TIMEOUT = int(os.getenv("CHUNK_TIMEOUT", "20"))  # Timeout per chunk (detik) - ANTI HANG
 POLL_INTERVAL = 0.5             # interval cek stop_event pada queue
+# FIX BUG #5: batas waktu TOTAL rotasi model per request (anti request menggantung ~5 menit)
+ROTATION_DEADLINE = float(os.getenv("INPEKSI_ROTATION_DEADLINE", "120"))
+MAX_CONSECUTIVE_MODEL_FAILURES = int(os.getenv("INPEKSI_MODEL_FAIL_LIMIT", "3"))
+# FIX BUG #7: batas ukuran body request (anti OOM dari payload raksasa)
+MAX_BODY_BYTES = int(os.getenv("INPEKSI_MAX_BODY_MB", "10")) * 1024 * 1024
 
 # ============ 3. STATE GLOBAL ============
 last_request_time = time.time()
@@ -418,6 +423,8 @@ cache_timestamp = None
 shutdown_timer = None
 state_lock = threading.Lock()   # lindungi timer & state antar-thread
 active_streams = 0              # jumlah stream berjalan (blokir shutdown paksa)
+# FIX BUG #5: circuit-breaker per model — model yang berulang kali gagal tidak dirotasi lagi
+model_fail_counts = {}
 
 # ============ 4. BLACKLIST MODEL LAMBAT ============
 SLOW_MODELS = [
@@ -512,6 +519,8 @@ def score_model_for_coding(model, provider):
 
     return score
 
+model_fetch_lock = threading.Lock()  # FIX: anti thundering-herd refetch saat cache expired
+
 def fetch_and_filter_models(force=False):
     global cached_models, cache_timestamp
 
@@ -519,6 +528,16 @@ def fetch_and_filter_models(force=False):
     if not force and cached_models is not None and cache_timestamp is not None:
         if datetime.now() - cache_timestamp < timedelta(seconds=CACHE_DURATION):
             return cached_models
+
+    # FIX: double-checked locking — hanya SATU thread yang refetch, sisanya tunggu & pakai hasil cache
+    with model_fetch_lock:
+        if not force and cached_models is not None and cache_timestamp is not None:
+            if datetime.now() - cache_timestamp < timedelta(seconds=CACHE_DURATION):
+                return cached_models
+        return _fetch_and_filter_models_locked()
+
+def _fetch_and_filter_models_locked():
+    global cached_models, cache_timestamp
 
     # bangun pada SALINAN — jangan pernah mutasi list cache yang mungkin dibaca thread lain
     pool = [] if cached_models is None else copy.deepcopy(cached_models)
@@ -566,13 +585,17 @@ def fetch_and_filter_models(force=False):
             or_count = 0
             or_candidates = []
             for m in resp.json().get("data", []):
-                pricing = m.get("pricing", {})
-                # FIX BUG #12: perbandingan harga numerik, bukan string persis "0"
-                try:
-                    prompt_price = float(pricing.get("prompt", 1))
-                except (TypeError, ValueError):
-                    prompt_price = 1
-                if prompt_price == 0 and ":free" in m.get("id", ""):
+                pricing = m.get("pricing", {}) or {}
+                # FIX BUG #12: perbandingan harga NUMERIK (prompt DAN completion),
+                # bukan string persis "0"; nilai tak-valid dianggap berbayar (=1).
+                def _price(v):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return 1.0
+                prompt_price = _price(pricing.get("prompt", 1))
+                completion_price = _price(pricing.get("completion", 1))
+                if prompt_price == 0 and completion_price == 0 and ":free" in m.get("id", ""):
                     if is_coding_model(m, "openrouter"):
                         or_candidates.append({
                             "id": m["id"],
@@ -656,9 +679,9 @@ def optimize_prompt_messages(messages):
         content = msg.get("content", "")
         # FIX BUG #8: content list/multimodal (image parts) dilewati apa adanya
         if isinstance(content, str):
+            # FIX: JANGAN strip tiap baris — merusak indentasi kode dalam snippet.
+            # Hanya normalisasi 3+ baris kosong berturut-turut jadi maksimal 2.
             content = re.sub(r'\n{3,}', '\n\n', content)
-            lines = [line.strip() for line in content.split('\n')]
-            content = '\n'.join(lines)
         new_msg = {"role": msg.get("role", "user"), "content": content}
         # pertahankan field percakapan standar
         for extra in ("name", "tool_calls", "tool_call_id"):
@@ -682,13 +705,30 @@ def call_llm(model_info, payload, stream=False):
     # FIX BUG #7: payload client (temperature, max_tokens, tools, dst.) diteruskan utuh
     payload = {**payload, "model": model_info['id'], "stream": bool(stream)}
 
+    # FIX BUG #2 (connection leak): reuse koneksi via Session bersama per provider.
+    sess = _get_upstream_session(model_info["provider"])
     # FIX BUG #15: hierarki timeout konsisten (read > chunk timeout)
-    resp = requests.post(
+    resp = sess.post(
         f"{model_info['base_url']}/chat/completions",
         headers=headers, json=payload, stream=stream,
         timeout=(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_READ_TIMEOUT)
     )
     return resp
+
+# Session bersama per-provider: pooling & daur-ulang koneksi HTTP ke upstream.
+_upstream_sessions = {}
+_upstream_sessions_lock = threading.Lock()
+
+def _get_upstream_session(provider):
+    with _upstream_sessions_lock:
+        sess = _upstream_sessions.get(provider)
+        if sess is None:
+            sess = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            _upstream_sessions[provider] = sess
+        return sess
 
 def stream_with_chunk_timeout(resp, timeout_seconds):
     """
@@ -747,9 +787,21 @@ def stream_with_chunk_timeout(resp, timeout_seconds):
         except Exception:
             pass
 
+def _bump_model_failure(model_id):
+    """Catat kegagalan model; kembalikan True bila circuit-breaker aktif (melewati)."""
+    with state_lock:
+        n = model_fail_counts.get(model_id, 0) + 1
+        model_fail_counts[model_id] = n
+        return n >= MAX_CONSECUTIVE_MODEL_FAILURES
+
+def _reset_model_failure(model_id):
+    with state_lock:
+        model_fail_counts.pop(model_id, None)
+
 def smart_route(payload, stream=False):
     global last_request_time
-    last_request_time = time.time()
+    with state_lock:
+        last_request_time = time.time()
 
     models = fetch_and_filter_models()
     if not models:
@@ -773,27 +825,62 @@ def smart_route(payload, stream=False):
     base_payload.setdefault("temperature", DEFAULT_CODING_TEMPERATURE)
 
     if not stream:
+        # FIX: rotasi non-stream dibatasi deadline TOTAL (anti request menggantung 5 menit)
+        deadline = time.monotonic() + ROTATION_DEADLINE
         for model in models:
+            if time.monotonic() > deadline:
+                log(f"⏱️ Batas waktu rotasi {ROTATION_DEADLINE}s terlampaui, hentikan rotasi.")
+                break
+            # FIX BUG #5: circuit-breaker — lewati model yang berulang kali gagal
+            with state_lock:
+                fails = model_fail_counts.get(model["id"], 0)
+            if fails >= MAX_CONSECUTIVE_MODEL_FAILURES:
+                log(f"🚫 {model['id']} dilewati (circuit breaker: {fails}x gagal berturut)")
+                continue
+            resp = None
             try:
                 resp = call_llm(model, {**base_payload, "messages": optimized_messages}, False)
                 if resp.status_code == 200:
                     log(f"✅ Berhasil (Non-stream): {model['id']}")
-                    return resp
+                    _reset_model_failure(model["id"])
+                    return resp  # caller mengambil .content lalu close (lihat do_POST)
                 else:
                     log(f"⚠️ {model['id']} gagal (Status {resp.status_code}), rotasi...")
+                    _bump_model_failure(model["id"])
             except requests.exceptions.Timeout:
                 log(f"⏱️ {model['id']} timeout, rotasi...")
+                _bump_model_failure(model["id"])
             except Exception as e:
                 log(f"❌ {model['id']} error: {e}, rotasi...")
+                _bump_model_failure(model["id"])
+            finally:
+                # FIX BUG (connection leak): respons yang TIDAK jadi dikembalikan selalu ditutup
+                if resp is not None and resp.status_code != 200:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
         return None
     else:
         def stream_generator():
             accumulated_response = ""
             model_idx = 0
             deltas_sent = 0
+            # FIX BUG #5: rotasi stream juga dibatasi deadline TOTAL
+            deadline = time.monotonic() + ROTATION_DEADLINE
 
             while model_idx < len(models):
                 model = models[model_idx]
+                if time.monotonic() > deadline:
+                    log(f"⏱️ Batas waktu rotasi {ROTATION_DEADLINE}s terlampaui (stream).")
+                    break
+                # FIX BUG #5: circuit-breaker — lewati model yang berulang kali gagal
+                with state_lock:
+                    fails = model_fail_counts.get(model["id"], 0)
+                if fails >= MAX_CONSECUTIVE_MODEL_FAILURES:
+                    log(f"🚫 {model['id']} dilewati (circuit breaker: {fails}x gagal berturut)")
+                    model_idx += 1
+                    continue
                 log(f"🎯 Streaming dengan model #{model_idx+1}: {model['id']}")
 
                 current_messages = list(optimized_messages)
@@ -812,10 +899,17 @@ def smart_route(payload, stream=False):
 
                     if resp.status_code != 200:
                         log(f"⚠️ {model['id']} gagal (Status {resp.status_code}), rotasi...")
+                        # FIX BUG #2 (connection leak): respons error non-200 harus ditutup
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        _bump_model_failure(model["id"])
                         model_idx += 1
                         continue
 
                     log(f"✅ Berhasil stream: {model['id']}")
+                    _reset_model_failure(model["id"])
                     stream_completed = False
 
                     for line in stream_with_chunk_timeout(resp, CHUNK_TIMEOUT):
@@ -833,7 +927,9 @@ def smart_route(payload, stream=False):
                                 if delta:
                                     accumulated_response += delta
                                     deltas_sent += 1
-                                yield f"data: {json.dumps(data)}\n\n"
+                                # FIX BUG #9: teruskan chunk SSE APA ADANYA (tanpa re-serialisasi)
+                                # agar field tak dikenal (reasoning, usage, dll.) tidak hilang.
+                                yield f"{line_str}\n\n"
                             except json.JSONDecodeError:
                                 pass
 
@@ -841,16 +937,20 @@ def smart_route(payload, stream=False):
                         return
                     else:
                         log(f"⚠️ Stream {model['id']} terputus, rotasi...")
+                        _bump_model_failure(model["id"])
                         model_idx += 1
 
                 except TimeoutError as e:
                     log(f"⏱️ {model['id']} hang ({e}), rotasi paksa...")
+                    _bump_model_failure(model["id"])
                     model_idx += 1
                 except requests.exceptions.Timeout:
                     log(f"⏱️ {model['id']} timeout, rotasi...")
+                    _bump_model_failure(model["id"])
                     model_idx += 1
                 except Exception as e:
                     log(f"❌ {model['id']} error: {e}. Rotasi...")
+                    _bump_model_failure(model["id"])
                     model_idx += 1
 
             # FIX BUG #5: beri tahu client lewat SSE error bila semua model habis
@@ -870,15 +970,33 @@ def reset_idle_timer():
         shutdown_timer.daemon = True
         shutdown_timer.start()
 
+shutdown_evt = threading.Event()   # FIX: flag shutdown yang bisa dilihat semua thread
+_server_ref = None                 # referensi instance ThreadingHTTPServer utk shutdown rapi
+
 def shutdown_server():
+    global _server_ref
+    # FIX BUG #3: baca state di bawah lock (hindari race dengan thread request)
+    with state_lock:
+        streams = active_streams
+        idle_for = time.time() - last_request_time
     # FIX BUG #4: jangan bunuh proses saat masih ada stream aktif
-    if active_streams > 0:
+    if streams > 0:
         log("⏳ Shutdown ditunda: masih ada stream aktif")
         return
-    if time.time() - last_request_time >= IDLE_TIMEOUT:
+    if idle_for >= IDLE_TIMEOUT:
         log(f"💤 Idle {IDLE_TIMEOUT}s, shutdown server...")
-        # keluar RAPI (bukan os._exit) agar atexit ikut jalan -> PID file dibersihkan
-        raise SystemExit(0)
+        shutdown_evt.set()
+        # FIX BUG #1: SystemExit di thread timer TIDAK menghentikan proses utama
+        # (proses jadi zombie). Matikan serve_forever() secara anggun lewat
+        # shutdown(), tutup socket, baru keluar dari proses.
+        try:
+            if _server_ref is not None:
+                _server_ref.shutdown()
+                _server_ref.server_close()
+        except Exception:
+            pass
+        cleanup_pidfile()
+        os._exit(0)   # pastikan tidak ada thread non-daemon yang menahan proses
 
 class SmartHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -899,8 +1017,27 @@ class SmartHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        try:
+            self._do_post_inner()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # klien memutuskan koneksi di tengah jalan — abaikan
+        except Exception as e:
+            # FIX BUG #4: error tak terduga TIDAK boleh memutus socket tanpa respons HTTP
+            # (pemicu utama "[WinError 10053] connection aborted").
+            log(f"❌ Unhandled error di do_POST: {e}")
+            try:
+                self.send_json_error(500, f"Internal router error: {e}")
+            except Exception:
+                pass
+
+    def _do_post_inner(self):
         global last_request_time, active_streams
-        last_request_time = time.time()
+        # FIX: jangan layani request baru saat proses sedang dimatikan (idle shutdown)
+        if shutdown_evt.is_set():
+            self.send_json_error(503, "Server is shutting down")
+            return
+        with state_lock:
+            last_request_time = time.time()
         reset_idle_timer()
 
         # FIX BUG #19: routing eksplisit
@@ -908,12 +1045,27 @@ class SmartHandler(BaseHTTPRequestHandler):
             self.send_json_error(404, f"Unknown endpoint: {self.path}")
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        # FIX BUG #7: validasi Content-Length + batas ukuran body (anti OOM / ValueError)
+        raw_cl = self.headers.get("Content-Length")
+        try:
+            content_length = int(raw_cl) if raw_cl else 0
+        except ValueError:
+            self.send_json_error(400, "Invalid Content-Length header")
+            return
+        if content_length < 0:
+            self.send_json_error(400, "Invalid Content-Length header")
+            return
+        if content_length > MAX_BODY_BYTES:
+            self.send_json_error(413, f"Request body too large (max {MAX_BODY_BYTES // (1024 * 1024)} MB)")
+            return
         body = self.rfile.read(content_length)
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:  # FIX BUG #16: bukan bare `except:`
             self.send_json_error(400, "Invalid JSON")
+            return
+        if not isinstance(payload, dict):
+            self.send_json_error(400, "Request body must be a JSON object")
             return
 
         stream = bool(payload.get("stream", False))
@@ -924,12 +1076,21 @@ class SmartHandler(BaseHTTPRequestHandler):
             return
 
         if stream:
-            # FIX BUG #6: prime generator sampai chunk pertama keluar
+            # FIX BUG #8: prime generator sampai chunk pertama keluar — exception saat
+            # priming dilaporkan sebagai HTTP error, bukan socket yang diputus mendadak.
             first_chunk = None
             try:
                 first_chunk = next(iter(result))
             except StopIteration:
                 first_chunk = None
+            except Exception as e:
+                log(f"❌ Gagal memulai stream: {e}")
+                try:
+                    result.close()
+                except Exception:
+                    pass
+                self.send_json_error(502, f"Stream init error: {e}")
+                return
 
             self.send_response(200)
             self.send_header("Content-type", "text/event-stream")
@@ -959,11 +1120,22 @@ class SmartHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 # FIX BUG #4: timer di-reset setelah request selesai
-                last_request_time = time.time()
-                reset_idle_timer()
+                with state_lock:
+                    last_request_time = time.time()
+                if not shutdown_evt.is_set():   # jangan bangunkan proses yang sedang shutdown
+                    reset_idle_timer()
         else:
-            body_bytes = result.content
-            self.send_response(result.status_code)
+            # FIX BUG (connection leak): respons upstream non-stream SELALU ditutup
+            # setelah isinya dibaca — jangan sampai socket menggantung.
+            try:
+                body_bytes = result.content
+                status = result.status_code
+            finally:
+                try:
+                    result.close()
+                except Exception:
+                    pass
+            self.send_response(status)
             self.send_header("Content-type", "application/json")
             self.send_header("Content-Length", str(len(body_bytes)))
             self.end_headers()
@@ -971,16 +1143,26 @@ class SmartHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global last_request_time
-        last_request_time = time.time()
+        # FIX: /health tidak boleh menghidupkan kembali idle timer setelah
+        # shutdown dijadwalkan — kalau tidak, server jadi zombie selamanya.
+        if shutdown_evt.is_set():
+            self.send_json_error(503, "Server is shutting down")
+            return
+        with state_lock:
+            last_request_time = time.time()
         reset_idle_timer()
 
         if self.path == "/health":
-            models = fetch_and_filter_models()
+            # FIX: jangan pernah lempar TypeError saat cache masih kosong (None)
+            try:
+                models = fetch_and_filter_models() or []
+            except Exception:
+                models = cached_models or []
             body = json.dumps({
                 "status": "ok",
                 "models_count": len(models),
-                "groq_count": len([m for m in models if m["provider"] == "groq"]),
-                "openrouter_count": len([m for m in models if m["provider"] == "openrouter"])
+                "groq_count": len([m for m in models if m.get("provider") == "groq"]),
+                "openrouter_count": len([m for m in models if m.get("provider") == "openrouter"])
             }).encode()
             # FIX: selalu kirim Content-Length (protocol_version HTTP/1.1) agar client tidak menunggu
             self.send_response(200)
@@ -1024,6 +1206,10 @@ def main():
 
     # FIX BUG #2: ThreadingHTTPServer agar streaming panjang tidak memblokir request lain
     server = ThreadingHTTPServer((HOST, PORT), SmartHandler)
+    global _server_ref
+    _server_ref = server   # shutdown_server() memakai referensi ini utk berhenti rapi
+    # FIX BUG #11: thread klien daemon → sisa thread tak menahan proses saat shutdown
+    server.daemon_threads = True
     reset_idle_timer()
     try:
         log("✅ Server siap! Continue bisa mulai digunakan.")

@@ -5,7 +5,7 @@ Mode API key yang diuji:
   - 1 key saja                 -> T13/T14, provider tanpa key otomatis DILEWATI
     (tanpa prompt/pilihan), router tetap berjalan penuh dari 1 provider.
 """
-import os, sys, json, time, threading, subprocess
+import os, sys, json, time, threading, subprocess, tempfile
 
 os.environ["GROQ_API_KEY"] = "gsk-test-key-longer-than-10-chars"
 os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-testkeylonger10"
@@ -100,7 +100,7 @@ check("T4 invalid JSON -> 400 JSON", r.status_code==400 and "error" in r.json())
 # T5: non-stream success + payload params diteruskan (FIX BUG #7)
 r = requests.post(f"{B}/v1/chat/completions", json={
     "messages":[{"role":"user","content":"hi"}], "temperature":0.42, "max_tokens":123, "stream":False}, timeout=10)
-up = json.load(open("/tmp/last_payload.json"))
+up = json.load(open(os.path.join(tempfile.gettempdir(), "last_payload.json")))
 check("T5 non-stream 200 + content", r.status_code==200 and r.json()["choices"][0]["message"]["content"]=="halo dunia")
 check("T5b temperature & max_tokens diteruskan ke upstream",
       up.get("temperature")==0.42 and up.get("max_tokens")==123)
@@ -115,20 +115,20 @@ check("T6 stream SSE utuh s/d [DONE]", r.status_code==200 and text=="Halo dunia!
 # T7: multimodal content list tidak dirusak (FIX BUG #8)
 mm = [{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"x"}}]}]
 r = requests.post(f"{B}/v1/chat/completions", json={"messages":mm,"stream":False}, timeout=10)
-up = json.load(open("/tmp/last_payload.json"))
+up = json.load(open(os.path.join(tempfile.gettempdir(), "last_payload.json")))
 mm_msg = next(m for m in up["messages"] if m["role"] == "user")  # system prompt coding disisipkan di index 0
 check("T7 content list multimodal dipertahankan", isinstance(mm_msg["content"], list) and len(mm_msg["content"])==2)
 
 # T7b: temperature default 0.4 disisipkan bila client tidak mengirimnya + system prompt coding
 mm = [{"role":"user","content":"buatkan fungsi"}]
 r = requests.post(f"{B}/v1/chat/completions", json={"messages":mm,"stream":False}, timeout=10)
-up = json.load(open("/tmp/last_payload.json"))
+up = json.load(open(os.path.join(tempfile.gettempdir(), "last_payload.json")))
 check("T7b temperature default 0.4 terkirim ke upstream", up.get("temperature") == 0.4)
 check("T7b system prompt coding disisipkan", up["messages"][0]["role"]=="system" and "expert programming assistant" in up["messages"][0]["content"])
 
 # T7c: temperature dari client TIDAK ditimpa
 r = requests.post(f"{B}/v1/chat/completions", json={"messages":mm,"temperature":0.9,"stream":False}, timeout=10)
-up = json.load(open("/tmp/last_payload.json"))
+up = json.load(open(os.path.join(tempfile.gettempdir(), "last_payload.json")))
 check("T7c temperature client (0.9) menang atas default", up.get("temperature") == 0.9)
 
 # T8: concurrency — streaming tidak memblokir /health (FIX BUG #2 ThreadingHTTPServer)
@@ -149,7 +149,7 @@ check("T8 /health tidak terblokir saat stream berjalan", res.get("health_during_
 
 # T9: rotasi saat model pertama hang (upstream 9902 diam) -> stream tetap selesai dari model sehat
 #     + verifikasi cache: fetch provider tidak dipanggil ulang tiap request (FIX BUG #11)
-try: os.remove("/tmp/hit_count.txt")
+try: os.remove(os.path.join(tempfile.gettempdir(), "hit_count.txt"))
 except Exception: pass
 n_fetch_before = ncalls_fetch["n"]
 r = requests.post(f"{B}/v1/chat/completions", json={
